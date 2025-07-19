@@ -1,0 +1,509 @@
+Deploy a full-stack JavaScript application to
+Cloud Run with Cloud SQL for PostgreSQL
+1. Overview
+Cloud Run is a fully managed platform that enables you to run your code directly on top of Google's
+scalable infrastructure. In this workshop, we will be learning on how to connect a Next.js application
+on Cloud Run to a Cloud SQL for PostgreSQL database.
+In this lab, you will learn how to:
+●​ Create a Cloud SQL for PostgreSQL instance
+●​ Deploy an application to Cloud Run that connects to your Cloud SQL database
+2. Open Cloud Shell Editor​
+​
+Before you begin, create a new project or choose to reuse an existing project. Once you have set up
+the project and selected the correct project. You can then open the Cloud Sheel Editor. ​
+​
+If prompted to authorize, click Authorize to continue.
+1.​ Navigate to Cloud Shell EditorShell
+export PROJECT_ID=$(gcloud config get-value project)
+You should be able to see the message:​
+Your active configuration is: [cloudshell-146]​
+You can also check the value of the $PROJECT_ID by running the following command:
+Shell
+echo $PROJECT_ID
+3. Enable APIs
+In the terminal, enable the APIs:
+Shell
+gcloud services enable \
+compute.googleapis.com \
+sqladmin.googleapis.com \
+run.googleapis.com \
+artifactregistry.googleapis.com \
+cloudbuild.googleapis.com \
+networkconnectivity.googleapis.com \
+servicenetworking.googleapis.com \
+cloudaicompanion.googleapis.com
+If prompted to authorize, click Authorize to continue.
+This command may take a few minutes to complete, but it should eventually produce a successful
+message similar to this one:
+Operation "operations/acf.p2-73d90d00-47ee-447a-b600" finished
+successfully.4. Set up a Service Account
+Create and configure a Google Cloud service account to be used by Cloud Run so that it has the
+correct permissions to connect to Cloud SQL.
+Run the gcloud iam service-accounts create command as follows to create a new
+service account:
+Shell
+gcloud iam service-accounts create quickstart-service-account \
+--display-name="Quickstart Service Account"
+​
+​
+Run the gcloud projects add-iam-policy-binding command as follows to add the Log Writer role
+to the Google Cloud service account you just created.​
+​
+Shell
+gcloud projects add-iam-policy-binding ${GOOGLE_CLOUD_PROJECT} \
+--member="serviceAccount:quickstart-service-account@${GOOGLE_CLOUD_PROJECT}.iam
+.gserviceaccount.com" \
+--role="roles/logging.logWriter"
+5. Create Cloud SQL Database
+Create a Service Connection Policy to allow network connectivity from Cloud Run to Cloud
+SQL with Private Service Connect​
+Shell
+gcloud network-connectivity service-connection-policies create
+quickstart-policy \
+--network=default \
+--project=${GOOGLE_CLOUD_PROJECT} \
+--region=us-central1 \
+--service-class=google-cloud-sql \--subnets=https://www.googleapis.com/compute/v1/projects/${GOOGLE_CLOUD_PROJECT
+}/regions/us-central1/subnetworks/default
+Generate a unique password for your database:
+Shell
+export DB_PASSWORD=$(openssl rand -base64 20)
+Run the gcloud sql instances create command to create a Cloud SQL instance:
+Shell
+gcloud sql instances create quickstart-instance \
+--project=${GOOGLE_CLOUD_PROJECT} \
+--root-password=${DB_PASSWORD} \
+--database-version=POSTGRES_17 \
+--tier=db-perf-optimized-N-2 \
+--region=us-central1 \
+--ssl-mode=ENCRYPTED_ONLY \
+--no-assign-ip \
+--enable-private-service-connect \
+--psc-auto-connections=network=projects/${GOOGLE_CLOUD_PROJECT}/global/networks
+/default
+This command may take a few minutes to complete.
+Run the gcloud sql databases create command to create a Cloud SQL database within
+the quickstart-instance.
+Shell
+gcloud sql databases create quickstart_db \
+--instance=quickstart-instance8. Prepare Application​
+Prepare a Next.js application that responds to HTTP requests.
+To create a new Next.js project named task-app, use the command:
+Shell
+npx --yes create-next-app@15.1.0 task-app \
+--ts \
+--eslint \
+--tailwind \
+--no-src-dir \
+--turbopack \
+--app \
+--no-import-alias
+Change directory into task-app:
+Shell
+cd task-app
+Install pg to interact with the PostgreSQL database.​
+Shell
+npm install pg
+​
+Install @types/pg as a dev dependency to use a TypeScript Next.js application.​
+Shell
+npm install --save-dev @types/pg
+Open Cloud Shell Editor, navigate to task-app/app, and create actions.tsCopy the following code and paste it into the opened actions.ts file:
+TypeScript
+'use server'
+import pg from 'pg';
+type Task = {
+id: string;
+title: string;
+status: 'IN_PROGRESS' | 'COMPLETE';
+};
+const { Pool } = pg;
+const pool = new Pool({
+host: process.env.DB_HOST,
+user: process.env.DB_USER,
+password: process.env.DB_PASSWORD,
+database: process.env.DB_NAME,
+ssl: {
+// @ts-expect-error require true is not recognized by @types/pg, but does
+exist on pg
+require: true,
+rejectUnauthorized: false, // required for self-signed certs
+// https://node-postgres.com/features/ssl#self-signed-cert
+}
+});
+const tableCreationIfDoesNotExist = async () => {await pool.query(`CREATE TABLE IF NOT EXISTS tasks (
+id SERIAL NOT NULL,
+created_at timestamp NOT NULL,
+status VARCHAR(255) NOT NULL default 'IN_PROGRESS',
+title VARCHAR(1024) NOT NULL,
+PRIMARY KEY (id)
+);`);
+}
+// CREATE
+export async function addNewTaskToDatabase(newTask: string) {
+await tableCreationIfDoesNotExist();
+await pool.query(`INSERT INTO tasks(created_at, status, title) VALUES(NOW(),
+'IN_PROGRESS', $1)`, [newTask]);
+return;
+}
+// READ
+export async function getTasksFromDatabase() {
+await tableCreationIfDoesNotExist();
+const { rows } = await pool.query(`SELECT id, created_at, status, title FROM
+tasks ORDER BY created_at DESC LIMIT 100`);
+return rows;
+}
+// UPDATE
+export async function updateTaskInDatabase(task: Task) {
+await tableCreationIfDoesNotExist();
+await pool.query(
+`UPDATE tasks SET status = $1, title = $2 WHERE id = $3`,
+[task.status, task.title, task.id]
+);
+return;
+}
+// DELETE
+export async function deleteTaskFromDatabase(taskId: string) {
+await tableCreationIfDoesNotExist();
+await pool.query(`DELETE FROM tasks WHERE id = $1`, [taskId]);
+return;
+}
+Open the page.tsx file in Cloud Shell Editor:Delete the existing contents of the page.tsx file.
+Copy the following code and paste it into the opened page.tsx file:
+TypeScript
+'use client'
+import React, { useEffect, useState } from "react";
+import { addNewTaskToDatabase, getTasksFromDatabase, deleteTaskFromDatabase,
+updateTaskInDatabase } from "./actions";
+type Task = {
+id: string;
+title: string;
+status: 'IN_PROGRESS' | 'COMPLETE';
+};
+export default function Home() {
+const [newTaskTitle, setNewTaskTitle] = useState('');
+const [tasks, setTasks] = useState<Task[]>([]);
+async function getTasks() {
+const updatedListOfTasks = await getTasksFromDatabase();
+setTasks(updatedListOfTasks);
+}
+useEffect(() => {
+getTasks();
+}, []);async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+e.preventDefault();
+await addNewTaskToDatabase(newTaskTitle);
+await getTasks();
+setNewTaskTitle('');
+};
+async function updateTask(task: Task, newTaskValues: Partial<Task>) {
+await updateTaskInDatabase({ ...task, ...newTaskValues });
+await getTasks();
+}
+async function deleteTask(taskId: string) {
+await deleteTaskFromDatabase(taskId);
+await getTasks();
+}
+return (
+<main className="p-4">
+<h2 className="text-2xl font-bold mb-4">To Do List</h2>
+<div className="flex mb-4">
+<form onSubmit={handleSubmit} className="flex mb-8">
+<input
+type="text"
+placeholder="New Task Title"
+value={newTaskTitle}
+onChange={(e) => setNewTaskTitle(e.target.value)}
+className="flex-grow border border-gray-400 rounded px-3 py-2 mr-2
+bg-inherit"
+/>
+<button
+type="submit"
+className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2
+px-4 rounded text-nowrap"
+>
+Add New Task
+</button>
+</form>
+</div>
+<table className="w-full">
+<tbody>
+{tasks.map(function (task) {
+const isComplete = task.status === 'COMPLETE';return (
+<tr key={task.id} className="border-b border-gray-200">
+<td className="py-2 px-4">
+<input
+type="checkbox"
+checked={isComplete}
+onClick={() => updateTask(task, { status: isComplete ?
+'IN_PROGRESS' : 'COMPLETE' })}
+className="transition-transform duration-300 ease-in-out
+transform scale-100 checked:scale-125 checked:bg-green-500"
+/>
+</td>
+<td className="py-2 px-4">
+<span
+className={`transition-all duration-300 ease-in-out
+${isComplete ? 'line-through text-gray-400 opacity-50' : 'opacity-100'}`}
+>
+{task.title}
+</span>
+</td>
+<td className="py-2 px-4">
+<button
+onClick={() => deleteTask(task.id)}
+className="bg-red-500 hover:bg-red-700 text-white font-bold
+py-2 px-4 rounded float-right"
+>
+Delete
+</button>
+</td>
+</tr>
+);
+})}
+</tbody>
+</table>
+</main>
+);
+}
+The application is now ready to be deployed.
+6. Deploy the application to Cloud Run
+Run the gcloud projects add-iam-policy-binding command as follows to add the Network User role to
+the Cloud Run service account for the Cloud Run service you are about to create.Shell
+gcloud projects add-iam-policy-binding ${GOOGLE_CLOUD_PROJECT} \
+--member "serviceAccount:service-$(gcloud projects describe
+${GOOGLE_CLOUD_PROJECT}
+--format="value(projectNumber)")@serverless-robot-prod.iam.gserviceaccount.com"
+\
+--role "roles/compute.networkUser"
+Run the gcloud projects add-iam-policy-binding command as follows to add the Artifact Registry
+Writer role to the current user for the Cloud Run service you are about to create.
+Shell
+gcloud projects add-iam-policy-binding ${GOOGLE_CLOUD_PROJECT} \
+--member=user:$(gcloud auth list --filter=status:ACTIVE
+--format="value(account)") \
+--role="roles/artifactregistry.writer"
+Create the Artifact Registry repository.
+Shell
+gcloud artifacts repositories create cloud-run-source-deploy \
+--repository-format=docker \
+--location=us-central1 \
+--description="Docker repository for Cloud Run"
+An Artifact Registry repository is a secure, fully managed service by Google Cloud that stores
+and manages your build artifacts ( Example: Docker container images)
+Verify that the repository was created
+Shell
+gcloud artifacts repositories list --location=us-central1
+Make sure cloud-run-source-deploy appears in the list.​
+Run the command below to deploy your application to Cloud Run:​
+Shell
+gcloud run deploy helloworld \
+--region=us-central1 \
+--source=. \
+--set-env-vars DB_NAME="quickstart_db" \
+--set-env-vars DB_USER="postgres" \
+--set-env-vars DB_PASSWORD=${DB_PASSWORD} \
+--set-env-vars DB_HOST="$(gcloud sql instances describe quickstart-instance
+--project=${GOOGLE_CLOUD_PROJECT}
+--format='value(settings.ipConfiguration.pscConfig.pscAutoConnections.ipAddress
+)')" \
+--service-account="quickstart-service-account@${GOOGLE_CLOUD_PROJECT}.iam.gserv
+iceaccount.com" \
+--network=default \
+--subnet=default \
+--allow-unauthenticated
+If prompted, press Y and Enter to confirm that you would like to continue:
+Do you want to continue (Y/n)? Y
+After a few minutes, the application should provide a URL for you to visit.
+Navigate to the URL to see your application in action. Every time you visit the URL or refresh the
+page, you will see the task app.
+7. Add a feature with Gemini Code Assist
+​
+Now you've deployed a web app with a database. Next, we're going to add a new feature to our
+next.js app using the power of AI assistance.
+Return to Cloud Shell Editor, Open page.tsx again
+Navigate to Gemini Code Assist within Cloud Shell Editor:
+●​ Click the Gemini icon ​ in the toolbar on the left side of the screen​
+​​
+●​ If prompted, sign in with your Google Account credentials
+●​ If prompted to select a project, select the project you created for this Codelab​
+​
+Enter the prompt: Add the ability to update the title of the task. The code in
+your output should be complete and working code.. The response should include
+something like these snippets to add a handleEditStart and handleEditCancel functions:
+TypeScript
+const [editingTaskId, setEditingTaskId] = useState('');
+const [editedTaskTitle, setEditedTaskTitle] = useState('');
+function handleEditStart(task: Task) {
+setEditingTaskId(task.id);
+setEditedTaskTitle(task.title);
+};
+​
+Replace page.tsx with the output of Gemini Code Assist. Here is a working example:
+TypeScript
+'use client'
+import React, { useEffect, useState } from "react";
+import { addNewTaskToDatabase, getTasksFromDatabase, deleteTaskFromDatabase,
+updateTaskInDatabase } from "./actions";type Task = {
+id: string;
+title: string;
+status: 'IN_PROGRESS' | 'COMPLETE';
+};
+export default function Home() {
+const [newTaskTitle, setNewTaskTitle] = useState('');
+const [tasks, setTasks] = useState<Task[]>([]);
+const [editingTaskId, setEditingTaskId] = useState('');
+const [editedTaskTitle, setEditedTaskTitle] = useState('');
+async function getTasks() {
+const updatedListOfTasks = await getTasksFromDatabase();
+setTasks(updatedListOfTasks);
+}
+useEffect(() => {
+getTasks();
+}, []);
+async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+e.preventDefault();
+await addNewTaskToDatabase(newTaskTitle);
+await getTasks();
+setNewTaskTitle('');
+};
+async function updateTask(task: Task, newTaskValues: Partial<Task>) {
+await updateTaskInDatabase({ ...task, ...newTaskValues });
+await getTasks();
+setEditingTaskId('');
+setEditedTaskTitle('');
+}
+async function deleteTask(taskId: string) {
+await deleteTaskFromDatabase(taskId);
+await getTasks();
+}
+function handleEditStart(task: Task) {
+setEditingTaskId(task.id);
+setEditedTaskTitle(task.title);};
+return (
+<main className="p-4">
+<h2 className="text-2xl font-bold mb-4">To Do List</h2>
+<div className="flex mb-4">
+<form onSubmit={handleSubmit} className="flex mb-8">
+<input
+type="text"
+placeholder="New Task Title"
+value={newTaskTitle}
+onChange={(e) => setNewTaskTitle(e.target.value)}
+className="flex-grow border border-gray-400 rounded px-3 py-2 mr-2
+bg-inherit"
+/>
+<button
+type="submit"
+className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2
+px-4 rounded text-nowrap"
+>
+Add New Task
+</button>
+</form>
+</div>
+<table className="w-full">
+<tbody>
+{tasks.map(function (task) {
+const isComplete = task.status === 'COMPLETE';
+return (
+<tr key={task.id} className="border-b border-gray-200">
+<td className="py-2 px-4">
+<input
+type="checkbox"
+checked={isComplete}
+onClick={() => updateTask(task, { status: isComplete ?
+'IN_PROGRESS' : 'COMPLETE' })}
+className="transition-transform duration-300 ease-in-out
+transform scale-100 checked:scale-125 checked:bg-green-500"
+/>
+</td>
+<td className="py-2 px-4">
+{editingTaskId === task.id ? (
+<form
+onSubmit={(e) => {e.preventDefault();
+updateTask(task, { title: editedTaskTitle });
+}}
+className="flex"
+>
+<input
+type="text"
+value={editedTaskTitle}
+onChange={(e) => setEditedTaskTitle(e.target.value)}
+onBlur={() => updateTask(task, { title: editedTaskTitle
+})} // Handle clicking outside input
+className="flex-grow border border-gray-400 rounded
+px-3 py-1 mr-2 bg-inherit"
+/>
+</form>
+) : (
+<span
+onClick={() => handleEditStart(task)}
+className={`transition-all duration-300 ease-in-out
+cursor-pointer ${isComplete ? 'line-through text-gray-400 opacity-50' :
+'opacity-100'}`}
+>
+{task.title}
+</span>
+)}
+</td>
+<td className="py-2 px-4">
+<button
+onClick={() => deleteTask(task.id)}
+className="bg-red-500 hover:bg-red-700 text-white font-bold
+py-2 px-4 rounded float-right"
+>
+Delete
+</button>
+</td>
+</tr>
+);
+})}
+</tbody>
+</table>
+</main>
+);
+}8. Redeploy the application to Cloud Run​
+​
+Run the command below to deploy your application to Cloud Run:​
+​
+Shell
+gcloud run deploy helloworld \
+--region=us-central1 \
+--source=. \
+--set-env-vars DB_NAME="quickstart_db" \
+--set-env-vars DB_USER="postgres" \
+--set-env-vars DB_PASSWORD=${DB_PASSWORD} \
+--set-env-vars DB_HOST="$(gcloud sql instances describe quickstart-instance
+--project=${GOOGLE_CLOUD_PROJECT}
+--format='value(settings.ipConfiguration.pscConfig.pscAutoConnections.ipAddress
+)')" \
+--service-account="quickstart-service-account@${GOOGLE_CLOUD_PROJECT}.iam.gserv
+iceaccount.com" \
+--network=default \
+--subnet=default \
+--allow-unauthenticated
+If prompted, press Y and Enter to confirm that you would like to continue:
+Do you want to continue (Y/n)? Y9. Congratulations
+In this workshop, you have learned how to do the following:
+●​ Create a Cloud SQL for PostgreSQL instance
+●​ Deploy an application to Cloud Run that connects to your Cloud SQL database
+Clean up
+Cloud SQL does not have a free tier and will charge you if you continue to use it. You can delete your
+Cloud project to avoid incurring additional charges.
+While Cloud Run does not charge when the service is not in use, you might still be charged for
+storing the container image in Artifact Registry. Deleting your Cloud project stops billing for all the
+resources used within that project.
+You can delete the SQL instance:
+Shell
+gcloud sql instances delete quickstart-instance
+You may also wish to delete unnecessary resources from your CloudShell disk. You can:
+1.​ Delete the codelab project directory:
+None
+rm -rf ~/task-app
+2.​ Warning! This next action can't be undone! If you would like to delete everything on your
+Cloud Shell to free up space, you can delete your whole home directory. Be careful that
+everything you want to keep is saved somewhere else.
+None
+sudo rm -rf $HOME
+If you would like, delete the project:None
+gcloud projects delete $GOOGLE_CLOUD_PROJECT
